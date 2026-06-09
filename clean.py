@@ -15,7 +15,7 @@ The cleaning is idempotent, so re-running on an already-clean file is harmless.
 import re
 
 SRC = "input.txt"
-DST = "input.txt"   # overwrite the source in place
+DST = "input.txt"
 
 # ---------------------------------------------------------------------------
 # 1. Whole-line patterns: if a line matches any of these, DROP the entire line.
