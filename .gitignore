@@ -1,0 +1,13 @@
+# Training data (copyrighted corpus — do not commit / redistribute)
+input.txt
+input_raw.txt
+
+# Generated artifacts (rebuilt by running the scripts)
+model.pt
+tok.model
+tok.vocab
+
+# Python virtual environment
+.venv/
+__pycache__/
+*.pyc

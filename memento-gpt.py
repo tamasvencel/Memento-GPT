@@ -1,22 +1,30 @@
 import sentencepiece as spm
 import os
+import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
 batch_size = 64 # number of independent sequences that will be processed in parallel
-block_size = 256 # maximum context length for predictions
+block_size = 128 # maximum context length for predictions
 max_iters = 5000
-eval_interval = 500
+eval_interval = 100 # evaluate often so we catch the best-val checkpoint before it overfits
 learning_rate = 3e-4
+warmup_iters = 100          # linear LR warmup steps before cosine decay (stabilizes early attention)
+lr_decay_iters = max_iters  # cosine decays across the whole training run
+min_lr = 3e-5               # LR floor at the end of decay (~learning_rate / 10)
+patience = 5               # evals without val improvement before early stopping
 device = "cuda" if torch.cuda.is_available() else "cpu"
 eval_iters = 200
-n_embd = 384
+# Model is deliberately small: with a fixed ~300k-token corpus, a large model overfits
+# almost immediately (train loss -> 0.1 while val loss climbs). Less capacity + more dropout.
+n_embd = 192
 n_head = 6
-n_layer = 6
-dropout = 0.2
+n_layer = 4
+dropout = 0.15
 
 torch.manual_seed(1337)
+torch.set_float32_matmul_precision("high") # use TF32 matmuls on the GPU (faster, negligible accuracy cost)
 
 with open("input.txt", "r", encoding="utf-8") as f:
     text = f.read()
@@ -199,15 +207,20 @@ class GPTLanguageModel(nn.Module):
         
         return logits, loss
     
-    def generate(self, idx, max_new_tokens):
+    @torch.no_grad() # sampling needs no gradients -> saves memory and time
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         # idx is (B,T) array of indices in the current context
         for _ in range(max_new_tokens):
             # crop idx to the last block_size tokens
             idx_cond = idx[:, -block_size:]
             # get the predictions
             logits, loss = self(idx_cond)
-            # focus only on the last time step
-            logits = logits[:, -1, :] # becomes (B, vocab_size)
+            # focus only on the last time step, scaled by temperature (lower = more confident/repetitive)
+            logits = logits[:, -1, :] / temperature # becomes (B, vocab_size)
+            # optionally restrict sampling to the top_k most likely tokens
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = float("-inf")
             # apply softmax to get the probabilities
             probs = F.softmax(logits, dim=-1) # (B, vocab_size)
             # sample from the distribution
@@ -220,12 +233,7 @@ model = GPTLanguageModel()
 m = model.to(device)
 
 # the number of parameters in the model
-print(sum(p.numel() for p in m.parameters())/1e6, "M parameters")
-
-# logits, loss = m(xb, yb)
-# print(logits.shape)
-# print(loss)
-# print(decode(m.generate(torch.zeros((1, 1), dtype=torch.long), max_new_tokens=100)[0].tolist()))
+# print(sum(p.numel() for p in m.parameters())/1e6, "M parameters")
 
 MODEL_PATH = "model.pt"
 
@@ -237,27 +245,68 @@ if os.path.exists(MODEL_PATH):
     print(f"loaded trained model from {MODEL_PATH} (skipped training)")
 else:
     optimizer = torch.optim.AdamW(m.parameters(), lr=learning_rate)
+    use_amp = (device == "cuda") # mixed precision only helps on the GPU
 
-    for iter in range(max_iters):
-        
+    # learning-rate schedule: linear warmup then cosine decay (the transformer-idiomatic schedule)
+    def get_lr(it):
+        # 1) linear warmup for the first warmup_iters steps
+        if it < warmup_iters:
+            return learning_rate * (it + 1) / warmup_iters
+        # 2) past the decay horizon, hold flat at the floor
+        if it > lr_decay_iters:
+            return min_lr
+        # 3) in between, cosine-decay smoothly from learning_rate down to min_lr
+        decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # goes 1 -> 0
+        return min_lr + coeff * (learning_rate - min_lr)
+
+    best_val = float("inf")   # best val loss seen -> checkpoint only when it improves
+    patience_left = patience  # evals remaining before we stop early
+
+    for step in range(max_iters):
+
+        # set this step's learning rate from the warmup+cosine schedule
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+
         # every once in a while evaluate the loss on train and val sets
-        if iter % eval_interval == 0:
+        if step % eval_interval == 0:
             losses = estimate_loss()
-            print(f"step {iter}: train loss {losses["train"]:.4f}, val loss {losses["val"]:.4f}")
-        
+            print(f"step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, lr {lr:.2e}")
+            if losses["val"] < best_val:
+                # validation improved -> save best weights and refill patience
+                best_val = losses["val"]
+                patience_left = patience
+                torch.save(m.state_dict(), MODEL_PATH) # save only the weights, not the whole object
+                print(f"  new best val {best_val:.4f} -> saved {MODEL_PATH}")
+            else:
+                # no improvement -> spend one patience credit, stop when exhausted
+                patience_left -= 1
+                if patience_left == 0:
+                    print(f"early stopping at step {step} (no val improvement in {patience} evals)")
+                    break
+
         # sample a batch of data
         xb, yb = get_batch("train")
 
-        # evaluate the loss
-        logits, loss = m(xb, yb)
+        # forward pass (bfloat16 autocast on GPU for speed + lower memory)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=use_amp):
+            logits, loss = m(xb, yb)
+
+        # backward + update
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0) # clip gradients for training stability
         optimizer.step()
 
-    print(f"final train loss: {loss.item():.4f}")
-    torch.save(m.state_dict(), MODEL_PATH)   # save only the weights, not the whole object
-    print(f"saved trained model to {MODEL_PATH}")
+    print(f"training done. best val loss {best_val:.4f} (saved to {MODEL_PATH})")
+    # current weights in memory are the LAST step -> reload the best checkpoint before generating
+    m.load_state_dict(torch.load(MODEL_PATH))
 
 # generate from the model
-context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+m.eval() # disable dropout for inference
+# seed from a real prompt: <unk> (id 0) renders as "?", and whitespace-only seeds normalize
+# to empty, so we use a natural screenplay opener that the model has seen at the start of scenes.
+context = torch.tensor([encode("INT.")], dtype=torch.long, device=device)
+print(decode(m.generate(context, max_new_tokens=500, temperature=0.8, top_k=200)[0].tolist()))
