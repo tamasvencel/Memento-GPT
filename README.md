@@ -2,8 +2,8 @@
 
 A small, from-scratch GPT-style language model trained on a corpus of Christopher
 Nolan screenplays (Memento, Inception, The Prestige, Interstellar). It learns the
-*structure and voice* of a screenplay — scene headings, character cues, dialogue,
-action lines — and generates new scene-like text in that style.
+*structure and voice* of a screenplay - scene headings, character cues, dialogue,
+action lines - and generates new scene-like text in that style.
 
 This is an educational project built up from Andrej Karpathy's nanoGPT-style
 tutorial, but with a real BPE tokenizer, a data-cleaning pipeline, mixed-precision
@@ -37,7 +37,7 @@ A decoder-only Transformer (GPT), implemented in [memento-gpt.py](memento-gpt.py
 | `max_iters` | 5000 | upper bound; early stopping usually halts sooner |
 | vocab size | 4096 | SentencePiece BPE |
 
-~3.4M parameters total. Deliberately small to match the fixed dataset size — a larger
+~3.4M parameters total. Deliberately small to match the fixed dataset size - a larger
 model overfits this corpus almost immediately.
 
 ### Training features
@@ -46,7 +46,7 @@ model overfits this corpus almost immediately.
 - **Gradient clipping** at 1.0
 - **Cosine LR schedule with linear warmup** (the transformer-idiomatic schedule)
 - **Early stopping** with patience on validation loss
-- **Best-val checkpointing** — saves `model.pt` only when validation improves, then
+- **Best-val checkpointing** - saves `model.pt` only when validation improves, then
   reloads the best checkpoint before generating (never the overfit final step)
 
 ---
@@ -55,8 +55,8 @@ model overfits this corpus almost immediately.
 
 A **SentencePiece BPE** tokenizer (4096 tokens) trained on the corpus, chosen over:
 
-- *Character-level* — no production LLM uses it; subword tokens let the model start from word-pieces.
-- *tiktoken* — can't train a custom vocab, and its 50k–200k web-scale vocabs are wasteful on a small domain corpus.
+- *Character-level* - no production LLM uses it; subword tokens let the model start from word-pieces.
+- *tiktoken* - can't train a custom vocab, and its 50k–200k web-scale vocabs are wasteful on a small domain corpus.
 
 Configured with `byte_fallback=True` (lossless round-trip on any input) and a vocab
 sized to the corpus. Trained once to `tok.model` / `tok.vocab`, then reused.
@@ -72,7 +72,7 @@ Requires Python 3.x and an NVIDIA GPU is recommended (CPU works but is slow).
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
-# 2. install PyTorch (CUDA build — adjust the index for your GPU/driver)
+# 2. install PyTorch (CUDA build - adjust the index for your GPU/driver)
 pip install torch --index-url https://download.pytorch.org/whl/cu130
 
 # 3. install the rest
@@ -135,7 +135,7 @@ final config was reached empirically:
 
 Generated samples reproduce screenplay formatting (scene slugs, character cues,
 `(V.O.)`, `CUT TO:`) and the correct character/setting vocabulary per film, but are not
-coherent at the sentence or plot level — the expected ceiling at this scale.
+coherent at the sentence or plot level - the expected ceiling at this scale.
 
 ---
 
@@ -151,20 +151,20 @@ model.pt         # best model checkpoint (generated)
 ```
 
 Generated artifacts (`model.pt`, `tok.model`, `tok.vocab`, `input.txt`, `.venv/`)
-should be in `.gitignore` — they're build outputs, not source.
+should be in `.gitignore` - they're build outputs, not source.
 
 ---
 
 ## Data & licensing note
 
-**This is a personal project I built purely for my own education** — to learn how small
+**This is a personal project I built purely for my own education** - to learn how small
 language models, tokenizers, and the training pipeline work end-to-end. It is not a
 product and is not intended for commercial or public use.
 
 The training corpus is assembled from **copyrighted screenplays**, used here only for
 that private, educational purpose. The screenplay text is **not included in this
 repository** and must not be redistributed. The trained model weights are a **derivative
-work** of that copyrighted text, so they are **not redistributed** either — anyone
+work** of that copyrighted text, so they are **not redistributed** either - anyone
 reproducing this project should supply their own corpus. Rights-cleared alternatives:
 public-domain text from Project Gutenberg, openly-licensed datasets, or your own writing.
 
