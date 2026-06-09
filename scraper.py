@@ -7,7 +7,8 @@ movies = {
     "Memento": "https://imsdb.com/scripts/Memento.html",
     "Inception": "https://imsdb.com/scripts/Inception.html",
     "The Prestige": "https://imsdb.com/scripts/Prestige,-The.html",
-    "Interstellar": "https://imsdb.com/scripts/Interstellar.html"
+    "Interstellar": "https://imsdb.com/scripts/Interstellar.html",
+    "Tenet": "https://imsdb.com/scripts/Tenet.html"
 }
 
 output_file = "input.txt"
