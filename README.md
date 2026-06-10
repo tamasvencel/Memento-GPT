@@ -9,9 +9,9 @@ This is an educational project built up from Andrej Karpathy's nanoGPT-style
 tutorial, but with a real BPE tokenizer, a data-cleaning pipeline, mixed-precision
 training, a cosine learning-rate schedule, early stopping, and best-checkpointing.
 
-> **Note on output quality:** with a small (~300k-token) corpus and a ~3.4M-parameter
+> **Note on output quality:** with a small (~300k-token) corpus and a ~2.6M-parameter
 > model, the generated text is *format-correct but not coherent* sentence-to-sentence.
-> That's the expected ceiling for this data scale, not a bug. See [Results](#results).
+> That's the expected ceiling for this data scale. See [Results](#results).
 
 ---
 
@@ -21,7 +21,12 @@ A decoder-only Transformer (GPT), implemented in [memento-gpt.py](memento-gpt.py
 
 - Token + learned positional embeddings
 - A stack of Transformer `Block`s, each = pre-norm multi-head self-attention + feed-forward, with residual connections
-- Final LayerNorm + linear head projecting to next-token logits
+- **Fused causal self-attention**: one matmul computes Q/K/V for all heads, and
+  `F.scaled_dot_product_attention` (FlashAttention on GPU) handles the causal mask,
+  softmax, and attention dropout in a single kernel. The original didactic per-head
+  loop is kept commented out in the source for comparison.
+- Final LayerNorm + linear head projecting to next-token logits, **weight-tied** to the
+  token embedding (GPT-2 style) - the same matrix embeds tokens in and projects logits out
 
 ### Default hyperparameters
 
@@ -37,14 +42,17 @@ A decoder-only Transformer (GPT), implemented in [memento-gpt.py](memento-gpt.py
 | `max_iters` | 5000 | upper bound; early stopping usually halts sooner |
 | vocab size | 4096 | SentencePiece BPE |
 
-~3.4M parameters total. Deliberately small to match the fixed dataset size - a larger
-model overfits this corpus almost immediately.
+~2.6M parameters total (weight tying saves ~786k, ~23% of the untied model). Deliberately
+small to match the fixed dataset size - a larger model overfits this corpus almost
+immediately.
 
 ### Training features
 
-- **Mixed precision** (bfloat16 autocast) + **TF32** matmuls on GPU
+- **Mixed precision** (bfloat16 autocast) + **TF32** matmuls on GPU, for evaluation too
 - **Gradient clipping** at 1.0
 - **Cosine LR schedule with linear warmup** (the transformer-idiomatic schedule)
+- **AdamW with selective weight decay** - decay on matmul weights only; biases and
+  LayerNorm params are excluded (as in nanoGPT / GPT-2)
 - **Early stopping** with patience on validation loss
 - **Best-val checkpointing** - saves `model.pt` only when validation improves, then
   reloads the best checkpoint before generating (never the overfit final step)
@@ -127,11 +135,17 @@ the script) and seeds from `"INT."` so output opens on a scene heading.
 The dataset is small and fixed, so the model overfits if it has too much capacity. The
 final config was reached empirically:
 
-- **Best validation loss ≈ 5.09** (cross-entropy / nats).
-- A **dropout sweep** found a broad, flat minimum: `0.4 → 5.142`, `0.3 → 5.111`,
-  `0.2 → 5.092`, `0.15 → 5.086`. Improvements flatten into noise below 0.2; the
-  binding constraint is **corpus size**, not regularization.
-- Early stopping typically halts around step ~3000–3400, well before `max_iters`.
+- **Best validation loss ≈ 4.97** (cross-entropy / nats), with weight tying + GPT-2
+  init - an improvement over the untied baseline (≈ 5.09) with ~23% fewer parameters.
+- A **dropout sweep** (on the untied baseline) found a broad, flat minimum:
+  `0.4 → 5.142`, `0.3 → 5.111`, `0.2 → 5.092`, `0.15 → 5.086`. Improvements flatten
+  into noise below 0.2; the binding constraint is **corpus size**, not regularization.
+- Early stopping halts around step ~1000–1500, well before `max_iters`.
+- **A lesson learned the hard way:** tying the output head to the embedding without
+  also switching to GPT-2's N(0, 0.02) init inherits `nn.Embedding`'s default N(0, 1)
+  weights in the output projection - initial loss explodes to ~127 instead of
+  ln(4096) ≈ 8.3, and the run converges far worse (best val ≈ 6.02). Weight tying
+  and small-std init come as a pair.
 
 Generated samples reproduce screenplay formatting (scene slugs, character cues,
 `(V.O.)`, `CUT TO:`) and the correct character/setting vocabulary per film, but are not

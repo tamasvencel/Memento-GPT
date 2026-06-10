@@ -15,7 +15,8 @@ lr_decay_iters = max_iters  # cosine decays across the whole training run
 min_lr = 3e-5               # LR floor at the end of decay (~learning_rate / 10)
 patience = 5               # evals without val improvement before early stopping
 device = "cuda" if torch.cuda.is_available() else "cpu"
-eval_iters = 200
+use_amp = (device == "cuda") # mixed precision only helps on the GPU
+eval_iters = 50 # batches per loss estimate; 200 made evaluation dominate runtime (400 eval batches per 100 train steps)
 # Model is deliberately small: with a fixed ~300k-token corpus, a large model overfits
 # almost immediately (train loss -> 0.1 while val loss climbs). Less capacity + more dropout.
 n_embd = 192
@@ -48,13 +49,8 @@ encode = sp.Encode          # str  -> list[int]
 decode = sp.Decode          # list[int] -> str
 vocab_size = sp.vocab_size()
 
-# print(encode("hello world"))
-# print(decode(encode("hello world")))
-
 # encode the entire dataset and store it into a torch.Tensor
 data = torch.tensor(encode(text), dtype=torch.long)
-# print(data.shape, data.dtype)
-# print(data[:1000])
 
 # split data into train and validation sets
 n = int(0.9*len(data)) # first 90% will be train set, rest val
@@ -70,23 +66,6 @@ def get_batch(split):
     x, y = x.to(device), y.to(device)
     return x,y
 
-# xb, yb = get_batch("train")
-# print("inputs:")
-# print(xb.shape)
-# print(xb)
-# print("targets:")
-# print(yb.shape)
-# print(yb)
-# print("---")
-
-# for b in range(batch_size): # batch dimension
-#     for t in range(block_size): # time dimension
-#         context = xb[b, :t+1]
-#         target = yb[b, t]
-#         print(f"when input is {context.tolist()} the target: {target}")
-
-# print(xb)
-
 @torch.no_grad()
 def estimate_loss():
     out = {}
@@ -95,52 +74,84 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
-            logits, loss = model(X, Y)
+            with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=use_amp): # same precision as training
+                _, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
     return out
 
-class Head(nn.Module):
-    """ one head of self-attention """
-    
-    def __init__(self, head_size):
+# --- The original, didactic attention (kept for reference) ---
+# One explicit head at a time: separate K/Q/V projections per head, a materialized
+# (T, T) score matrix, a hand-applied causal mask from a `tril` buffer, then a Python
+# loop in MultiHeadAttention concatenating the heads. Readable, but slow: 24 small
+# matmuls per block where one big one would do, and every head stored its own
+# (block_size, block_size) tril mask in the checkpoint.
+#
+# class Head(nn.Module):
+#     """ one head of self-attention """
+#
+#     def __init__(self, head_size):
+#         super().__init__()
+#         self.key = nn.Linear(n_embd, head_size, bias=False)
+#         self.query = nn.Linear(n_embd, head_size, bias=False)
+#         self.value = nn.Linear(n_embd, head_size, bias=False)
+#         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+#
+#         self.dropout = nn.Dropout(dropout)
+#
+#     def forward(self, x):
+#         B,T,C = x.shape
+#         k = self.key(x) # (B,T,head_size)
+#         q = self.query(x) # (B,T,head_size)
+#         # compute attention scores ("affinities")
+#         wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5 # (B, T, head_size) @ (B, head_size, T) -> (B, T, T)
+#         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
+#         wei = F.softmax(wei, dim=-1) # (B, T, T)
+#         wei = self.dropout(wei)
+#         # perform the weighted aggregation of the values
+#         v = self.value(x) # (B,T,head_size)
+#         out = wei @ v # (B, T, T) @ (B, T, head_size) -> (B, T, head_size)
+#         return out
+#
+# class MultiHeadAttention(nn.Module):
+#     """ multiple heads of self-attention in parallel """
+#
+#     def __init__(self, num_heads, head_size):
+#         super().__init__()
+#         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+#         self.proj = nn.Linear(n_embd, n_embd)
+#         self.dropout = nn.Dropout(dropout)
+#
+#     def forward(self, x):
+#         out = torch.cat([h(x) for h in self.heads], dim=-1)
+#         out = self.dropout(self.proj(out))
+#         return out
+
+class CausalSelfAttention(nn.Module):
+    """ all heads in one fused pass (the production pattern, as in nanoGPT / GPT-2) """
+
+    def __init__(self):
         super().__init__()
-        self.key = nn.Linear(n_embd, head_size, bias=False)
-        self.query = nn.Linear(n_embd, head_size, bias=False)
-        self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
-        
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, x):
-        B,T,C = x.shape
-        k = self.key(x) # (B,T,head_size)
-        q = self.query(x) # (B,T,head_size)
-        # compute attention scores ("affinities")
-        wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5 # (B, T, head_size) @ (B, head_size, T) -> (B, T, T)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
-        wei = F.softmax(wei, dim=-1) # (B, T, T)
-        wei = self.dropout(wei)
-        # perform the weighted aggregation of the values
-        v = self.value(x) # (B,T,head_size)
-        out = wei @ v # (B, T, T) @ (B, T, head_size) -> (B, T, head_size)
-        return out
-    
-class MultiHeadAttention(nn.Module):
-    """ multiple heads of self-attention in parallel """
-    
-    def __init__(self, num_heads, head_size):
-        super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        # one matmul computes Q, K, V for every head at once
+        self.qkv = nn.Linear(n_embd, 3 * n_embd, bias=False)
         self.proj = nn.Linear(n_embd, n_embd)
         self.dropout = nn.Dropout(dropout)
-        
+
     def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.dropout(self.proj(out))
-        return out
-    
+        B, T, C = x.shape
+        q, k, v = self.qkv(x).split(n_embd, dim=2) # each (B, T, C)
+        # split channels into heads: (B, T, C) -> (B, n_head, T, head_size)
+        q = q.view(B, T, n_head, C // n_head).transpose(1, 2)
+        k = k.view(B, T, n_head, C // n_head).transpose(1, 2)
+        v = v.view(B, T, n_head, C // n_head).transpose(1, 2)
+        # fused kernel (FlashAttention on GPU): causal mask, softmax, and attention
+        # dropout happen inside - no materialized (T, T) matrix, no tril buffer
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout if self.training else 0.0, is_causal=True)
+        out = out.transpose(1, 2).contiguous().view(B, T, C) # re-assemble head outputs
+        return self.dropout(self.proj(out))
+
+
 class FeedForward(nn.Module):
     """ a simple linear layer followed by a non-linearity """
     
@@ -162,8 +173,9 @@ class Block(nn.Module):
     def __init__(self, n_embd, n_head):
         # n_embd: embedding dimension, n_head: the number of heads
         super().__init__()
-        head_size = n_embd // n_head
-        self.sa = MultiHeadAttention(n_head, head_size)
+        # head_size = n_embd // n_head
+        # self.sa = MultiHeadAttention(n_head, head_size) # old: explicit per-head loop
+        self.sa = CausalSelfAttention()
         self.ffwd = FeedForward(n_embd)
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
@@ -182,8 +194,23 @@ class GPTLanguageModel(nn.Module):
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd) # final layer norm
-        self.lm_head = nn.Linear(n_embd, vocab_size)
-        
+        # self.lm_head = nn.Linear(n_embd, vocab_size) # old: separate output matrix
+        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+        # weight tying (GPT-2 / nanoGPT): input embedding and output head share one matrix.
+        # Saves ~786k params (~23% of the model) - capacity this small corpus can't fill anyway.
+        self.lm_head.weight = self.token_embedding_table.weight
+        self.apply(self._init_weights) # GPT-2 style init (std=0.02) - REQUIRED once weights are tied
+
+    def _init_weights(self, module):
+        # Without this, the tied output head inherits nn.Embedding's default std=1, which makes the
+        # init logits huge (init loss ~126 instead of ~ln(vocab)=8.3) and wastes ~1000 steps recovering.
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(self, idx, targets=None):
         # B (batch), T (time), C (channel)
         
@@ -191,7 +218,7 @@ class GPTLanguageModel(nn.Module):
         
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx) # (B,T,C)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=idx.device)) # (T,C)
         x = tok_emb + pos_emb # (B,T,C)
         x = self.blocks(x) # (B,T,C)
         x = self.ln_f(x) # (B,T,C)
@@ -213,8 +240,8 @@ class GPTLanguageModel(nn.Module):
         for _ in range(max_new_tokens):
             # crop idx to the last block_size tokens
             idx_cond = idx[:, -block_size:]
-            # get the predictions
-            logits, loss = self(idx_cond)
+            # get the predictions (loss is None without targets)
+            logits, _ = self(idx_cond)
             # focus only on the last time step, scaled by temperature (lower = more confident/repetitive)
             logits = logits[:, -1, :] / temperature # becomes (B, vocab_size)
             # optionally restrict sampling to the top_k most likely tokens
@@ -229,33 +256,35 @@ class GPTLanguageModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
     
-model = GPTLanguageModel()
-m = model.to(device)
-
-# the number of parameters in the model
-# print(sum(p.numel() for p in m.parameters())/1e6, "M parameters")
+model = GPTLanguageModel().to(device)
+print(f"{sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters")
 
 MODEL_PATH = "model.pt"
 
 if os.path.exists(MODEL_PATH):
     # A trained model already exists on disk -> load its weights and skip training.
     # (state_dict = just the learned tensors; we load them into a fresh model of the same shape.)
-    m.load_state_dict(torch.load(MODEL_PATH))
-    m.eval()
+    # map_location lets a GPU-trained checkpoint load on a CPU-only machine;
+    # weights_only is the safe way to load files you didn't just create yourself
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))
+    model.eval()
     print(f"loaded trained model from {MODEL_PATH} (skipped training)")
 else:
-    optimizer = torch.optim.AdamW(m.parameters(), lr=learning_rate)
-    use_amp = (device == "cuda") # mixed precision only helps on the GPU
+    # weight decay only on the matmul weights (dim >= 2); biases and layernorm
+    # params are excluded, as in nanoGPT / GPT-2
+    decay_params = [p for p in model.parameters() if p.dim() >= 2]
+    nodecay_params = [p for p in model.parameters() if p.dim() < 2]
+    optimizer = torch.optim.AdamW([
+        {"params": decay_params, "weight_decay": 0.01},
+        {"params": nodecay_params, "weight_decay": 0.0},
+    ], lr=learning_rate)
 
     # learning-rate schedule: linear warmup then cosine decay (the transformer-idiomatic schedule)
     def get_lr(it):
         # 1) linear warmup for the first warmup_iters steps
         if it < warmup_iters:
             return learning_rate * (it + 1) / warmup_iters
-        # 2) past the decay horizon, hold flat at the floor
-        if it > lr_decay_iters:
-            return min_lr
-        # 3) in between, cosine-decay smoothly from learning_rate down to min_lr
+        # 2) then cosine-decay smoothly from learning_rate down to min_lr
         decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # goes 1 -> 0
         return min_lr + coeff * (learning_rate - min_lr)
@@ -278,7 +307,7 @@ else:
                 # validation improved -> save best weights and refill patience
                 best_val = losses["val"]
                 patience_left = patience
-                torch.save(m.state_dict(), MODEL_PATH) # save only the weights, not the whole object
+                torch.save(model.state_dict(), MODEL_PATH) # save only the weights, not the whole object
                 print(f"  new best val {best_val:.4f} -> saved {MODEL_PATH}")
             else:
                 # no improvement -> spend one patience credit, stop when exhausted
@@ -292,21 +321,21 @@ else:
 
         # forward pass (bfloat16 autocast on GPU for speed + lower memory)
         with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=use_amp):
-            logits, loss = m(xb, yb)
+            logits, loss = model(xb, yb)
 
         # backward + update
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0) # clip gradients for training stability
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # clip gradients for training stability
         optimizer.step()
 
     print(f"training done. best val loss {best_val:.4f} (saved to {MODEL_PATH})")
     # current weights in memory are the LAST step -> reload the best checkpoint before generating
-    m.load_state_dict(torch.load(MODEL_PATH))
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))
 
 # generate from the model
-m.eval() # disable dropout for inference
+model.eval() # disable dropout for inference
 # seed from a real prompt: <unk> (id 0) renders as "?", and whitespace-only seeds normalize
 # to empty, so we use a natural screenplay opener that the model has seen at the start of scenes.
 context = torch.tensor([encode("INT.")], dtype=torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens=500, temperature=0.8, top_k=200)[0].tolist()))
+print(decode(model.generate(context, max_new_tokens=500, temperature=0.8, top_k=200)[0].tolist()))
